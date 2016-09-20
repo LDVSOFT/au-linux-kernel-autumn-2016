@@ -45,8 +45,38 @@ static int __init test_stack(void)
 
 static int __init print_processes_backwards(void)
 {
-    // TODO
-    return -ENODEV;
+    int ret = 0;
+    LIST_HEAD(data_stack);
+
+    struct task_struct *proc;
+    for_each_process(proc) {
+        stack_entry_t *tos;
+        char* tos_data = kmalloc(TASK_COMM_LEN, GFP_KERNEL);
+        if (!tos_data) {
+            ret = ENOMEM;
+            break;
+        }
+        get_task_comm(tos_data, proc);
+        tos = create_stack_entry(tos_data);
+        if (!tos) {
+            ret = ENOMEM;
+            kfree(tos_data);
+            break;
+        }
+        stack_push(&data_stack, tos);
+    }
+
+    while (!stack_empty(&data_stack)) {
+        stack_entry_t *tos = stack_pop(&data_stack);
+        char *tos_data = STACK_ENTRY_DATA(tos, char *);
+        if (ret == 0) {
+            pr_alert("Proc: %s\n", tos_data);
+        }
+        kfree(tos_data);
+        delete_stack_entry(tos);
+    }
+
+    return ret;
 }
 
 static int __init ll_init(void)
