@@ -21,5 +21,6 @@ int main() {
 		}
 	}
 	printf("VM I just ate: %zu\n", available);
+	printf("Left to 128Tb: %zu\n", (((size_t)1) << 47) - available);
 	return 0;
 }
