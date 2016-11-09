@@ -17,14 +17,22 @@
 #include "../vsd_device/vsd_hw.h"
 #include "vsd_ioctl.h"
 
+#define BUFFER_SIZE PAGE_SIZE
 #define LOG_TAG "[VSD_CHAR_DEVICE] "
 
 typedef struct vsd_dev {
     struct miscdevice mdev;
     struct tasklet_struct dma_op_complete_tsk;
+    struct mutex lock;
+    wait_queue_head_t wait_queue;
     volatile vsd_hw_regs_t *hwregs;
 } vsd_dev_t;
 static vsd_dev_t *vsd_dev;
+
+static int vsd_ready(void) {
+    mb();
+    return vsd_dev->hwregs->cmd == VSD_CMD_NONE;
+}
 
 #define LOCAL_DEBUG 0
 static void print_vsd_dev_hw_regs(vsd_dev_t *vsd_dev)
@@ -65,29 +73,137 @@ static int vsd_dev_release(struct inode *inode, struct file *filp)
 static void vsd_dev_dma_op_complete_tsk_func(unsigned long unused)
 {
     (void)unused;
-    // TODO wake up thread waiting for VSD cmd completion
+    wake_up(&vsd_dev->wait_queue);
 }
 
 static ssize_t vsd_dev_read(struct file *filp,
     char __user *read_user_buf, size_t read_size, loff_t *fpos)
 {
-    (void)filp;
-    (void)read_user_buf;
-    (void)read_size;
-    (void)fpos;
-    // TODO
-    return -EINVAL;
+    int ret;
+    char* buffer;
+    phys_addr_t buffer_phys;
+    size_t read;
+
+    buffer = (char*) kmalloc(BUFFER_SIZE, GFP_KERNEL);
+    if (buffer == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    buffer_phys = virt_to_phys(buffer);
+    if (buffer_phys == (phys_addr_t)NULL) {
+        ret = -ENOMEM;
+        goto err_alloc;
+    }
+
+    mutex_lock(&vsd_dev->lock);
+
+    if (*fpos > vsd_dev->hwregs->dev_size) {
+        ret = -EINVAL;
+        goto err_read;
+    }
+
+    if (*fpos + read_size > vsd_dev->hwregs->dev_size)
+        read_size = vsd_dev->hwregs->dev_size - *fpos;
+
+    read = 0;
+    while (read < read_size) {
+        pr_notice(LOG_TAG "READ: read = %zu readsize = %zu\n", read, read_size);
+        vsd_dev->hwregs->dev_offset = *fpos + read;
+        vsd_dev->hwregs->dma_paddr = buffer_phys;
+        vsd_dev->hwregs->dma_size = BUFFER_SIZE;
+        wmb();
+        vsd_dev->hwregs->cmd = VSD_CMD_READ;
+
+        wait_event(vsd_dev->wait_queue, vsd_ready());
+        ret = vsd_dev->hwregs->result;
+
+        if (ret < 0) {
+            goto err_read;
+        }
+
+        if (copy_to_user(read_user_buf + read, buffer, ret)) {
+            ret = -EFAULT;
+            goto err_read;
+        }
+        read += ret;
+    }
+    *fpos += read_size;
+    ret = read_size;
+err_read:
+    mutex_unlock(&vsd_dev->lock);
+err_alloc:
+    kfree(buffer);
+err:
+    return ret;
 }
 
 static ssize_t vsd_dev_write(struct file *filp,
     const char __user *write_user_buf, size_t write_size, loff_t *fpos)
 {
-    (void)filp;
-    (void)write_user_buf;
-    (void)write_size;
-    (void)fpos;
-    // TODO
-    return -EINVAL;
+    int ret;
+    char* buffer;
+    phys_addr_t buffer_phys;
+    size_t wrote;
+
+    buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+    if (buffer == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    buffer_phys = virt_to_phys(buffer);
+    if (buffer_phys == (phys_addr_t)NULL) {
+        ret = -ENOMEM;
+        goto err_alloc;
+    }
+
+    mutex_lock(&vsd_dev->lock);
+
+    if (*fpos >= vsd_dev->hwregs->dev_size) {
+        ret = -EINVAL;
+        goto err_write;
+    }
+
+    if (*fpos + write_size > vsd_dev->hwregs->dev_size)
+        write_size = vsd_dev->hwregs->dev_size - *fpos;
+
+    wrote = 0;
+    while (wrote < write_size) {
+        size_t chunk = write_size - wrote;
+        if (chunk > BUFFER_SIZE)
+            chunk = BUFFER_SIZE;
+
+        if (copy_from_user(buffer, write_user_buf + wrote, chunk)) {
+            ret = -EFAULT;
+            goto err_write;
+        }
+
+        pr_notice(LOG_TAG "WRITE: wrote = %zu writesize = %zu chunk = %zu.\n", wrote, write_size, chunk);
+        vsd_dev->hwregs->dev_offset = *fpos + wrote;
+        vsd_dev->hwregs->dma_paddr = buffer_phys;
+        vsd_dev->hwregs->dma_size = chunk;
+        wmb();
+        vsd_dev->hwregs->cmd = VSD_CMD_WRITE;
+
+        wait_event(vsd_dev->wait_queue, vsd_ready());
+        ret = vsd_dev->hwregs->result;
+
+        if (ret < 0) {
+            goto err_write;
+        }
+
+        wrote += ret;
+    }
+    *fpos += write_size;
+    ret = write_size;
+
+err_write:
+    mutex_unlock(&vsd_dev->lock);
+err_alloc:
+    kfree(buffer);
+err:
+    return ret;
 }
 
 static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
@@ -118,9 +234,6 @@ static loff_t vsd_dev_llseek(struct file *filp, loff_t off, int whence)
 static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 {
     vsd_ioctl_get_size_arg_t arg;
-    if (copy_from_user(&arg, uarg, sizeof(arg)))
-        return -EFAULT;
-
     arg.size = vsd_dev->hwregs->dev_size;
 
     if (copy_to_user(uarg, &arg, sizeof(arg)))
@@ -130,8 +243,22 @@ static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 
 static long vsd_ioctl_set_size(vsd_ioctl_set_size_arg_t __user *uarg)
 {
-    (void)uarg;
-    return -EINVAL;
+    int ret;
+    vsd_ioctl_set_size_arg_t arg;
+    if (copy_from_user(&arg, uarg, sizeof(arg)))
+        return -EFAULT;
+
+    mutex_lock(&vsd_dev->lock);
+
+    vsd_dev->hwregs->dev_offset = arg.size;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_SET_SIZE;
+    wait_event(vsd_dev->wait_queue, vsd_ready());
+    ret = vsd_dev->hwregs->result;
+
+    mutex_unlock(&vsd_dev->lock);
+
+    return ret;
 }
 
 static long vsd_dev_ioctl(struct file *filp, unsigned int cmd,
@@ -177,6 +304,8 @@ static int vsd_driver_probe(struct platform_device *pdev)
     }
     tasklet_init(&vsd_dev->dma_op_complete_tsk,
             vsd_dev_dma_op_complete_tsk_func, 0);
+    mutex_init(&vsd_dev->lock);
+    init_waitqueue_head(&vsd_dev->wait_queue);
     vsd_dev->mdev.minor = MISC_DYNAMIC_MINOR;
     vsd_dev->mdev.name = "vsd";
     vsd_dev->mdev.fops = &vsd_dev_fops;
@@ -194,6 +323,7 @@ static int vsd_driver_probe(struct platform_device *pdev)
     }
     vsd_dev->hwregs = (volatile vsd_hw_regs_t*)
         phys_to_virt(vsd_control_regs_res->start);
+    vsd_dev->hwregs->tasklet_vaddr = &vsd_dev->dma_op_complete_tsk;
 
     print_vsd_dev_hw_regs(vsd_dev);
     pr_notice(LOG_TAG "VSD dev with MINOR %u"
@@ -203,6 +333,7 @@ static int vsd_driver_probe(struct platform_device *pdev)
 error_get_res:
     misc_deregister(&vsd_dev->mdev);
 error_misc_reg:
+    mutex_destroy(&vsd_dev->lock);
     kfree(vsd_dev);
     vsd_dev = NULL;
 error_alloc:

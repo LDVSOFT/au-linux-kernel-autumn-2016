@@ -55,25 +55,27 @@ static vsd_plat_device_t dev = {
 };
 
 static ssize_t vsd_dev_read(char *dst, size_t dst_size, size_t offset) {
-    (void)dst;
-    (void)dst_size;
-    (void)offset;
-    // TODO
-    return -EINVAL;
+    if (offset + dst_size > dev.buf_size)
+        dst_size = dev.buf_size - offset;
+
+    memcpy(dst, dev.vbuf + offset, dst_size);
+    return dst_size;
 }
 
 static ssize_t vsd_dev_write(char *src, size_t src_size, size_t offset) {
-    (void)src;
-    (void)src_size;
-    (void)offset;
-    // TODO
-    return -EINVAL;
+    if (offset + src_size > dev.buf_size)
+        src_size = dev.buf_size - offset;
+
+    memcpy(dev.vbuf + offset, src, src_size);
+    return src_size;
 }
 
-static void vsd_dev_set_size(size_t size)
+static ssize_t vsd_dev_set_size(size_t size)
 {
-    (void)size;
-    // TODO
+    if (size > dev.buf_size)
+        return -EINVAL;
+    dev.buf_size = size;
+    return 0;
 }
 
 static int vsd_dev_cmd_poll_kthread_func(void *data)
@@ -81,7 +83,8 @@ static int vsd_dev_cmd_poll_kthread_func(void *data)
     ssize_t ret = 0;
     while(!kthread_should_stop()) {
         mb();
-        switch(dev.hwregs->cmd) {
+        int cmd = dev.hwregs->cmd;
+        switch(cmd) {
             case VSD_CMD_READ:
                 ret = vsd_dev_read(
                         phys_to_virt((phys_addr_t)dev.hwregs->dma_paddr),
@@ -97,11 +100,17 @@ static int vsd_dev_cmd_poll_kthread_func(void *data)
                 );
                 break;
             case VSD_CMD_SET_SIZE:
-                vsd_dev_set_size((size_t)dev.hwregs->dev_offset);
+                ret = vsd_dev_set_size((size_t)dev.hwregs->dev_offset);
                 break;
         }
 
-        // TODO notify vsd_driver about finished cmd
+        if (cmd != VSD_CMD_NONE) {
+            dev.hwregs->result = ret;
+            dev.hwregs->cmd = VSD_CMD_NONE;
+            dev.hwregs->dev_size = dev.buf_size;
+            wmb();
+            tasklet_schedule((struct tasklet_struct*)dev.hwregs->tasklet_vaddr);
+        }
         // Sleep one sec not to waste CPU on polling
         ssleep(1);
     }
