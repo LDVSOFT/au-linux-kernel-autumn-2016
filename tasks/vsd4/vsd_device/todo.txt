@@ -1,2 +1,0 @@
-You'll probably use your implementation of vsd.ko
-from vsd3 task. No changes are needed.

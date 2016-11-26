@@ -1,10 +1,16 @@
 #ifndef _VSD_HW_H
 #define _VSD_HW_H
 
+#define VSD_CMD_MASK 0x0F
 #define VSD_CMD_NONE 0
 #define VSD_CMD_WRITE 1
 #define VSD_CMD_READ 2
 #define VSD_CMD_SET_SIZE 3
+#define VSD_CMD_GET_SIZE 4
+
+#define VSD_CMD_NONBLOCK 0x10
+#define VSD_CMD_DOING 0x20
+#define VSD_CMD_DONE 0x40
 
 typedef struct vsd_hw_regs {
     // Command to run

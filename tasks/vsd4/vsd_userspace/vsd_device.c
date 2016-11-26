@@ -23,16 +23,22 @@ int vsd_deinit()
     return close(vsd_fd);
 }
 
-int vsd_set_blocking(void)
-{
-    // TODO
-    return -1;
-}
-
 int vsd_set_nonblocking(void)
 {
-    // TODO
-    return -1;
+    int ret;
+    ret = fcntl(vsd_fd, F_GETFL);
+    if (ret < 0)
+        return ret;
+    return fcntl(vsd_fd, F_SETFL, ret | O_NONBLOCK);
+}
+
+int vsd_set_blocking(void)
+{
+    int ret;
+    ret = fcntl(vsd_fd, F_GETFL);
+    if (ret < 0)
+        return ret;
+    return fcntl(vsd_fd, F_SETFL, ret &(~O_NONBLOCK));
 }
 
 int vsd_get_size(size_t *out_size)
@@ -55,20 +61,27 @@ int vsd_set_size(size_t size)
 
 ssize_t vsd_read(char* dst, size_t size, off_t offset)
 {
-    if (lseek(vsd_fd, offset, SEEK_SET) == (off_t)-1)
-        return -1;
-    return read(vsd_fd, dst, size);
+    return pread(vsd_fd, dst, size, offset);
 }
 
 ssize_t vsd_write(const char* src, size_t size, off_t offset)
 {
-    if (lseek(vsd_fd, offset, SEEK_SET) == (off_t)-1)
-        return -1;
-    return write(vsd_fd, src, size);
+    return pwrite(vsd_fd, src, size, offset);
 }
 
 int vsd_wait_nonblock_write(void)
 {
-    // TODO
-    return -1;
+    static struct pollfd fds[1];
+    int ret;
+    fds[0].fd = vsd_fd;
+    fds[0].events = POLLOUT | POLLWRNORM;
+    fds[0].revents = 0;
+    ret = poll(fds, 1, -1);
+    if (ret < 0)
+        return ret;
+    if (ret != 1)
+        return 1;
+    if ((fds[0].revents & fds[0].events) == 0)
+        return 2;
+    return 0;
 }
